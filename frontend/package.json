@@ -1,0 +1,13 @@
+{
+    "name": "logo-detection-frontend",
+    "version": "1.0.0",
+    "description": "Frontend for Logo Detection App",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "express": "^4.17.1",
+        "axios": "^1.6.0"
+    }
+}

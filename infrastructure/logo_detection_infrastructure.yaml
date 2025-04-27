@@ -1,0 +1,957 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Logo Detection Infrastructure using CloudFormation
+
+Parameters:
+  ResourceSuffix:
+    Type: String
+    Description: Suffix to ensure unique and non-conflicting resource names (e.g., S3 buckets, Lambda functions).
+    Default: project
+    AllowedPattern: "^[a-z0-9-]+$"
+    ConstraintDescription: Must be lowercase alphanumeric characters or hyphens only.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: The name of an existing EC2 KeyPair to enable SSH access to the deployed EC2 instance.
+
+  SSHAllowedCidr:
+    Type: String
+    Description: The CIDR IP range allowed to access the EC2 instance via SSH (e.g., your public IP as 203.0.113.0/32).
+    Default: "0.0.0.0/0"
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))?$
+    ConstraintDescription: Must be a valid CIDR notation.
+
+Resources:
+  # IAM Role for the application
+  LogoDetectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub LogoDetectionRole-${ResourceSuffix}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LogoDetectionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::logo-detection-images-${AWS::AccountId}-${ResourceSuffix}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectTagging
+                Resource: !Sub arn:aws:s3:::logo-detection-images-${AWS::AccountId}-${ResourceSuffix}/*
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/LogoDetectionResults-${ResourceSuffix}
+              - Effect: Allow
+                Action:
+                  - sns:*
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:LogoDetectionNotifications-${ResourceSuffix}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: "*"
+
+  # S3 Bucket for storing images
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub logo-detection-images-${AWS::AccountId}-${ResourceSuffix}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorLambda.Arn
+
+  ImageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub arn:aws:s3:::logo-detection-images-${AWS::AccountId}-${ResourceSuffix}/*
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub LogoDetectionResults-${ResourceSuffix}
+      AttributeDefinitions:
+        - AttributeName: ImageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ImageId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  DetectionNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub LogoDetectionNotifications-${ResourceSuffix}
+
+  ImageProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ImageProcessor-${ResourceSuffix}
+      Handler: index.handler
+      Role: !GetAtt LogoDetectionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile:
+          Fn::Sub:
+            - |
+              import json
+              import boto3
+              import logging
+              import decimal
+
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+
+              s3_client = boto3.client('s3')
+              dynamodb = boto3.resource('dynamodb')
+              rekognition = boto3.client('rekognition')
+              sns = boto3.client('sns')
+
+              def convert_floats_to_decimal(obj):
+                  if isinstance(obj, float):
+                      return decimal.Decimal(str(obj))
+                  elif isinstance(obj, dict):
+                      return {k: convert_floats_to_decimal(v) for k, v in obj.items()}
+                  elif isinstance(obj, list):
+                      return [convert_floats_to_decimal(item) for item in obj]
+                  return obj
+
+              def handler(event, context):
+                  logger.info("ImageProcessorLambda event: %s", json.dumps(event))
+        
+                  if 'Records' in event and event['Records'][0].get('eventSource') == 'aws:s3':
+                      bucket = event['Records'][0]['s3']['bucket']['name']
+                      key = event['Records'][0]['s3']['object']['key']
+                      file_size = event['Records'][0]['s3']['object']['size']
+                      
+                      logger.info("Processing image: bucket=%s, key=%s, size=%s bytes", bucket, key, file_size)
+       
+                      response = s3_client.head_object(Bucket=bucket, Key=key)
+                      image_id = response.get('Metadata', {}).get('imageid')
+                      content_type = response.get('ContentType', 'unknown')
+                      if not image_id:
+                          logger.error("No imageId found in S3 metadata for key: %s", key)
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'No imageId found in S3 metadata'})
+                          }
+                      
+                      logger.info("Retrieved imageId from metadata: %s, Content-Type: %s", image_id, content_type)
+               
+                      if content_type not in ['image/jpeg', 'image/png']:
+                          logger.error("Unsupported Content-Type: %s for key: %s", content_type, key)
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': f'Unsupported Content-Type: {content_type}'})
+                          }
+                      
+  
+                      try:
+                          response = rekognition.detect_labels(
+                              Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+                              MaxLabels=10,
+                              MinConfidence=60  # Filter out low-confidence labels
+                          )
+                          # Log the full Rekognition response for debugging
+                          logger.info("Rekognition response: %s", json.dumps(response, default=str))
+                      except Exception as e:
+                          logger.error("Rekognition error for key %s: %s", key, str(e))
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps({'error': str(e)})
+                          }
+        
+                      highest_confidence_label = None
+                      highest_confidence = 0
+                      for label in response['Labels']:
+                          label_name = label['Name']
+                          confidence = label['Confidence']
+                          # Skip generic labels if desired (optional)
+                          if label_name in ['Person', 'Head', 'Human']:
+                              continue
+                          if confidence > highest_confidence:
+                              highest_confidence = confidence
+                              instances = label.get('Instances', [])
+                              highest_confidence_label = {
+                                  'Name': label_name,
+                                  'Confidence': confidence,
+                                  'BoundingBox': instances[0]['BoundingBox'] if instances else {}
+                              }
+                      
+                      if not highest_confidence_label:
+                          logger.info("No valid labels detected for image_id: %s", image_id)
+                          highest_confidence_label = {'Name': 'None', 'Confidence': 0, 'BoundingBox': {}}
+                          
+                      highest_confidence_label = convert_floats_to_decimal(highest_confidence_label)
+                      logger.info("Highest confidence label: %s, image_id: %s", highest_confidence_label, image_id)
+        
+                      try:
+                          table = dynamodb.Table('${TableName}')
+                          table.put_item(
+                              Item={
+                                  'ImageId': image_id,
+                                  'ImageKey': key,
+                                  'Label': highest_confidence_label  # Store as a single object, not a list
+                              }
+                          )
+                          logger.info("Stored results in DynamoDB: ImageId=%s", image_id)
+                      except Exception as e:
+                          logger.error("DynamoDB error for image_id %s: %s", image_id, str(e))
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps({'error': f'DynamoDB error: {str(e)}'})
+                          }
+                      
+                      # Publish notification to SNS
+                      try:
+                          sns.publish(
+                              TopicArn='${TopicArn}',
+                              Message=f'Label detection complete for image {key}. ImageId: {image_id}'
+                          )
+                          logger.info("Published SNS notification for image_id: %s", image_id)
+                      except Exception as e:
+                          logger.error("SNS error for image_id %s: %s", image_id, str(e))
+                          pass
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'ImageId': image_id, 'Label': highest_confidence_label}, default=str)
+                      }
+                  else:
+                      logger.error("Invalid request format: %s", json.dumps(event))
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid request format'})
+                      }
+            - TableName: !Sub LogoDetectionResults-${ResourceSuffix}
+              TopicArn: !Ref DetectionNotificationTopic
+
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImageProcessorLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::logo-detection-images-${AWS::AccountId}-${ResourceSuffix}
+
+  ImageUploaderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ImageUploader-${ResourceSuffix}
+      Handler: index.handler
+      Role: !GetAtt LogoDetectionRole.Arn
+      Runtime: python3.8
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile:
+          Fn::Sub:
+            - |
+              import json
+              import boto3
+              import logging
+              import uuid
+              import base64
+              import os
+
+              # Set up logging
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+
+              # Initialize S3 client
+              s3_client = boto3.client('s3')
+
+              def handler(event, context):
+                  try:
+                      # Log the event for debugging
+                      logger.info("Received event: %s", json.dumps(event))
+
+                      # Get the raw binary body
+                      body = event.get('body')
+                      if not body:
+                          logger.error("Request body is empty")
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'Request body is empty'}),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                                  'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                              }
+                          }
+
+                      if event.get('isBase64Encoded', False):
+                          body = base64.b64decode(body)
+
+                      logger.info("Body length: %d bytes", len(body))
+
+                      key = event['pathParameters']['key']
+                      bucket = '${BucketName}'
+
+                      file_extension = os.path.splitext(key)[1].lower()
+                      if file_extension in ['.jpg', '.jpeg']:
+                          content_type = 'image/jpeg'
+                      elif file_extension == '.png':
+                          content_type = 'image/png'
+                      else:
+                          logger.error("Unsupported file extension: %s", file_extension)
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': f'Unsupported file extension: {file_extension}'}),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                                  'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                              }
+                          }
+
+                      image_id = str(uuid.uuid4())
+                      logger.info("Generated imageId: %s", image_id)
+
+                      s3_client.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=body,
+                          ContentType=content_type,
+                          Metadata={
+                              'imageid': image_id
+                          }
+                      )
+
+                      logger.info("Image uploaded successfully: key=%s, imageId=%s", key, image_id)
+
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'Image uploaded successfully', 'key': key, 'imageId': image_id}),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                          }
+                      }
+                  except Exception as e:
+                      logger.error("Error: %s", str(e))
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': str(e)}),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                          }
+                      }
+            - BucketName: !Sub logo-detection-images-${AWS::AccountId}-${ResourceSuffix}
+
+  ResultsRetrieverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ResultsRetriever-${ResourceSuffix}
+      Handler: index.handler
+      Role: !GetAtt LogoDetectionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DetectionNotificationTopic
+      Code:
+        ZipFile:
+          Fn::Sub:
+            - |
+              import json
+              import boto3
+              import logging
+              import os
+              import decimal
+
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+
+              dynamodb = boto3.resource('dynamodb')
+              sns = boto3.client('sns')
+
+              SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+              EMAIL_ADDRESS = ''
+
+              def decimal_default(obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return float(obj)
+                  raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+              def handler(event, context):
+                  try:
+                      # Get the ImageId from the path parameter
+                      image_id = event['pathParameters']['imageId']
+                      logger.info("Retrieving results for ImageId: %s", image_id)
+
+                      # Retrieve results from DynamoDB
+                      table = dynamodb.Table('${TableName}')
+                      response = table.get_item(
+                          Key={
+                              'ImageId': image_id
+                          }
+                      )
+
+                      if 'Item' not in response:
+                          logger.warning("ImageId not found in DynamoDB: %s", image_id)
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps({'error': 'ImageId not found'}),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                                  'Access-Control-Allow-Methods': 'OPTIONS,GET'
+                              }
+                          }
+
+                      item = response['Item']
+                      logger.info("Results retrieved: %s", item)
+
+                      results = {
+                          'ImageId': item['ImageId'],
+                          'ImageKey': item['ImageKey'],
+                          'Label': item.get('Label', {'Name': 'None', 'Confidence': 0, 'BoundingBox': {}})
+                      }
+
+                      try:
+                          # Check if the email is already subscribed
+                          subscriptions = sns.list_subscriptions_by_topic(TopicArn=SNS_TOPIC_ARN)
+                          email_subscribed = any(
+                              sub['Protocol'] == 'email' and sub['Endpoint'] == EMAIL_ADDRESS
+                              for sub in subscriptions.get('Subscriptions', [])
+                          )
+
+                          if not email_subscribed:
+                              subscription_response = sns.subscribe(
+                                  TopicArn=SNS_TOPIC_ARN,
+                                  Protocol='email',
+                                  Endpoint=EMAIL_ADDRESS
+                              )
+                              logger.info("Subscribed email %s to SNS topic. Subscription ARN: %s",
+                                          EMAIL_ADDRESS, subscription_response['SubscriptionArn'])
+                          else:
+                              logger.info("Email %s is already subscribed to SNS topic.", EMAIL_ADDRESS)
+                      except Exception as e:
+                          logger.error("Failed to subscribe email %s: %s", EMAIL_ADDRESS, str(e))
+
+                      label = results['Label']
+                      label_details = f"{label['Name']} (Confidence: {label['Confidence']}%)" if label['Name'] != 'None' else "No labels detected."
+
+                      sns_message = (
+                          f"Label Detection Results for Image: {results['ImageKey']}\n"
+                          f"Image ID: {image_id}\n"
+                          f"Detected Label: {label_details}"
+                      )
+
+                      try:
+                          sns.publish(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Message=sns_message,
+                              Subject='Label Detection Results'
+                          )
+                          logger.info("Published SNS notification for image_id: %s", image_id)
+                      except Exception as e:
+                          logger.error("Failed to publish SNS notification for image_id %s: %s", image_id, str(e))
+                          # Continue execution even if SNS publish fails
+
+                      # Return results to the frontend
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(results, default=decimal_default),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                              'Access-Control-Allow-Methods': 'OPTIONS,GET'
+                          }
+                      }
+                  except Exception as e:
+                      logger.error("Error processing request for ImageId %s: %s", image_id, str(e))
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': str(e)}),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                              'Access-Control-Allow-Methods': 'OPTIONS,GET'
+                          }
+                      }
+            - TableName: !Sub LogoDetectionResults-${ResourceSuffix}
+
+  HistoryRetrieverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub HistoryRetriever-${ResourceSuffix}
+      Handler: index.handler
+      Role: !GetAtt LogoDetectionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile:
+          Fn::Sub:
+            - |
+              import json
+              import boto3
+              import logging
+              import decimal
+
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+
+              dynamodb = boto3.resource('dynamodb')
+
+              def decimal_default(obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return float(obj)
+                  raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+              def handler(event, context):
+                  try:
+                      table = dynamodb.Table('${TableName}')
+                      # Scan the table to get all items
+                      response = table.scan()
+                      items = response['Items']
+                      while 'LastEvaluatedKey' in response:
+                          response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                          items.extend(response['Items'])
+
+                      for item in items:
+                          if 'Logos' in item and 'Label' not in item:
+                              # For backward compatibility: if 'Logos' exists, take the first one or set to None
+                              item['Label'] = item['Logos'][0] if item['Logos'] else {'Name': 'None', 'Confidence': 0, 'BoundingBox': {}}
+                          elif 'Label' not in item:
+                              item['Label'] = {'Name': 'None', 'Confidence': 0, 'BoundingBox': {}}
+                          # Remove 'Logos' to clean up the response
+                          item.pop('Logos', None)
+
+                      logger.info("Retrieved %d items from DynamoDB", len(items))
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(items, default=decimal_default),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                              'Access-Control-Allow-Methods': 'OPTIONS,GET'
+                          }
+                      }
+                  except Exception as e:
+                      logger.error("Error retrieving history: %s", str(e))
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': str(e)}),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                              'Access-Control-Allow-Methods': 'OPTIONS,GET'
+                          }
+                      }
+            - TableName: !Sub LogoDetectionResults-${ResourceSuffix}
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImageUploaderLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ImageUploadApi}/*/POST/upload/*
+
+  ResultsLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ResultsRetrieverLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ImageUploadApi}/*/GET/results/*
+
+  HistoryLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HistoryRetrieverLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ImageUploadApi}/*/GET/history
+
+  ImageUploadApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub LogoDetectionApi-${ResourceSuffix}
+      Description: API for logo detection project
+      BinaryMediaTypes:
+        - "application/octet-stream"
+        - "image/jpeg"
+        - "image/png"
+
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ParentId: !GetAtt ImageUploadApi.RootResourceId
+      PathPart: upload
+
+  UploadKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ParentId: !Ref UploadResource
+      PathPart: "{key}"
+
+  UploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ResourceId: !Ref UploadKeyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageUploaderLambda.Arn}/invocations
+        ContentHandling: CONVERT_TO_BINARY
+      RequestParameters:
+        method.request.path.key: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+          ResponseModels:
+            "application/json": "Empty"
+
+  UploadCorsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ResourceId: !Ref UploadKeyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+
+  ResultsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ParentId: !GetAtt ImageUploadApi.RootResourceId
+      PathPart: results
+
+  ResultsImageIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ParentId: !Ref ResultsResource
+      PathPart: "{imageId}"
+
+  ResultsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ResourceId: !Ref ResultsImageIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResultsRetrieverLambda.Arn}/invocations
+      RequestParameters:
+        method.request.path.imageId: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+          ResponseModels:
+            "application/json": "Empty"
+
+  ResultsCorsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ResourceId: !Ref ResultsImageIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+
+  HistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ParentId: !GetAtt ImageUploadApi.RootResourceId
+      PathPart: history
+
+  HistoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ResourceId: !Ref HistoryResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HistoryRetrieverLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+          ResponseModels:
+            "application/json": "Empty"
+
+  HistoryCorsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      ResourceId: !Ref HistoryResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadMethod
+      - UploadCorsMethod
+      - ResultsMethod
+      - ResultsCorsMethod
+      - HistoryMethod
+      - HistoryCorsMethod
+    Properties:
+      RestApiId: !Ref ImageUploadApi
+      StageName: prod
+
+  LogoDetectionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub LogoDetectionVPC-${ResourceSuffix}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub LogoDetectionIGW-${ResourceSuffix}
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LogoDetectionVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LogoDetectionVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub LogoDetectionPublicSubnet-${ResourceSuffix}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LogoDetectionVPC
+      Tags:
+        - Key: Name
+          Value: !Sub LogoDetectionPublicRouteTable-${ResourceSuffix}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instance with restricted SSH and HTTP access
+      VpcId: !Ref LogoDetectionVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAllowedCidr
+          Description: Allow SSH access from a specific IP range
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP access to Node.js frontend
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTP traffic for updates
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTPS traffic for AWS services
+      Tags:
+        - Key: Name
+          Value: !Sub LogoDetectionEC2-${ResourceSuffix}-SecurityGroup
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref LogoDetectionRole
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      ImageId: ami-00a929b66ed6e0de6
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref PublicSubnet
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y nodejs
+          mkdir -p /var/www/logo-detection
+          chown ec2-user:ec2-user /var/www/logo-detection
+      Tags:
+        - Key: Name
+          Value: !Sub LogoDetectionEC2-${ResourceSuffix}
+
+Outputs:
+  S3BucketName:
+    Value: !Ref ImageBucket
+    Description: Name of the S3 bucket for images
+  DynamoDBTableName:
+    Value: !Ref ResultsTable
+    Description: Name of the DynamoDB table
+  ApiEndpoint:
+    Value: !Sub https://${ImageUploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Description: API Gateway endpoint URL
+  SNSTopicArn:
+    Value: !Ref DetectionNotificationTopic
+    Description: ARN of the SNS topic
+  EC2PublicIP:
+    Value: !GetAtt EC2Instance.PublicIp
+    Description: Public IP of the EC2 instance

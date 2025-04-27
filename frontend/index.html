@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LogoPulse App</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>LogoPulse App</h1>
+        
+        <p>Upload an image to detect Logo.</p>
+        
+        <div class="upload-container">
+            <form id="uploadForm">
+                <div class="file-input">
+                    <input type="file" id="imageInput" accept="image/*" required>
+                    <label for="imageInput">Choose an image</label>
+                </div>
+                <button type="submit" id="uploadButton">Upload & Detect Logo</button>
+            </form>
+            <div id="preview"></div>
+        </div>
+        
+        <div id="status" class="status"></div>
+        <div id="results" class="results"></div>       
+        <div id="history" class="history"></div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
